@@ -1,0 +1,260 @@
+"""
+면세점 가격 변동 모니터링 & 이메일 자동 알림 스크립트
+=====================================================
+사용법:
+  1. 아래 CONFIG 설정 (이메일, 감시할 상품, 알림 임계값)
+  2. pip install requests beautifulsoup4 schedule
+  3. python dutyful_monitor.py
+
+GitHub Actions로 자동화하면 서버 없이 매일 자동 실행 가능!
+"""
+
+import requests
+from bs4 import BeautifulSoup
+import json
+import os
+import smtplib
+import schedule
+import time
+from email.mime.multipart import MIMEMultipart
+from email.mime.text import MIMEText
+from datetime import datetime
+
+# ============================================================
+# ✅ 여기만 수정하면 됩니다
+# ============================================================
+CONFIG = {
+    # 이메일 설정 (Gmail 기준)
+    "sender_email": "your_gmail@gmail.com",       # 발신 Gmail 주소
+    "sender_password": "xxxx xxxx xxxx xxxx",     # Gmail 앱 비밀번호 (2단계 인증 후 발급)
+    "receiver_email": "your_email@example.com",   # 수신할 이메일
+
+    # 알림 기준: 가격이 몇 % 이상 변동될 때 알림 보낼지
+    "alert_threshold_pct": 5.0,  # 예: 5.0 → 5% 이상 변동 시 알림
+
+    # 모니터링할 상품 목록
+    # dutyful에서 상품 검색 후 URL 복사해서 붙여넣기
+    "products": [
+        {
+            "name": "샤넬 No.5 오 드 빠르펭 100ml",
+            "url": "https://dutyful.co.kr/ko/search?query=샤넬+no5",
+        },
+        {
+            "name": "조말론 블랙베리 앤 베이 코롱 100ml",
+            "url": "https://dutyful.co.kr/ko/search?query=조말론+블랙베리",
+        },
+        # 상품 추가하려면 여기에 계속 붙여넣기
+    ],
+}
+# ============================================================
+
+
+PRICE_DB_FILE = "price_history.json"
+
+
+# ── 가격 DB 로드/저장 ──────────────────────────────────────
+def load_price_db():
+    if os.path.exists(PRICE_DB_FILE):
+        with open(PRICE_DB_FILE, "r", encoding="utf-8") as f:
+            return json.load(f)
+    return {}
+
+
+def save_price_db(db):
+    with open(PRICE_DB_FILE, "w", encoding="utf-8") as f:
+        json.dump(db, f, ensure_ascii=False, indent=2)
+
+
+# ── dutyful 크롤링 ─────────────────────────────────────────
+def fetch_prices(product):
+    """dutyful에서 면세점별 가격 가져오기"""
+    headers = {
+        "User-Agent": (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) "
+            "Chrome/120.0.0.0 Safari/537.36"
+        )
+    }
+    try:
+        res = requests.get(product["url"], headers=headers, timeout=10)
+        res.raise_for_status()
+    except Exception as e:
+        print(f"  ❌ 크롤링 실패 ({product['name']}): {e}")
+        return {}
+
+    soup = BeautifulSoup(res.text, "html.parser")
+    prices = {}
+
+    # dutyful 가격 테이블 파싱 (사이트 구조에 따라 selector 조정 필요)
+    # 일반적인 가격 비교 테이블 구조를 타겟으로 함
+    price_items = soup.select(".price-compare-item, .shop-price, [class*='price']")
+    
+    for item in price_items:
+        shop_el = item.select_one("[class*='shop'], [class*='store'], [class*='name']")
+        price_el = item.select_one("[class*='price'], [class*='amount'], strong")
+        
+        if shop_el and price_el:
+            shop_name = shop_el.get_text(strip=True)
+            price_text = price_el.get_text(strip=True).replace(",", "").replace("원", "").replace("$", "").strip()
+            try:
+                prices[shop_name] = float(price_text)
+            except ValueError:
+                pass
+
+    # 파싱이 안 될 경우 숫자 포함 패턴으로 보완 시도
+    if not prices:
+        for tag in soup.find_all(text=True):
+            text = tag.strip()
+            if any(shop in text for shop in ["롯데", "신라", "신세계", "현대", "SK"]):
+                parent = tag.parent
+                price_tag = parent.find_next(text=lambda t: t and any(c.isdigit() for c in t))
+                if price_tag:
+                    price_text = "".join(filter(lambda c: c.isdigit() or c == ".", str(price_tag)))
+                    try:
+                        prices[text] = float(price_text)
+                    except ValueError:
+                        pass
+
+    return prices
+
+
+# ── 변동 감지 ──────────────────────────────────────────────
+def detect_changes(product_name, new_prices, db):
+    alerts = []
+    old_prices = db.get(product_name, {})
+
+    for shop, new_price in new_prices.items():
+        if shop in old_prices:
+            old_price = old_prices[shop]
+            if old_price == 0:
+                continue
+            change_pct = ((new_price - old_price) / old_price) * 100
+            if abs(change_pct) >= CONFIG["alert_threshold_pct"]:
+                direction = "🔻 하락" if change_pct < 0 else "🔺 상승"
+                alerts.append({
+                    "shop": shop,
+                    "old_price": old_price,
+                    "new_price": new_price,
+                    "change_pct": change_pct,
+                    "direction": direction,
+                })
+
+    return alerts
+
+
+# ── 이메일 발송 ────────────────────────────────────────────
+def send_alert_email(all_alerts):
+    if not all_alerts:
+        return
+
+    now = datetime.now().strftime("%Y-%m-%d %H:%M")
+
+    # HTML 이메일 본문 생성
+    rows = ""
+    for item in all_alerts:
+        color = "#d32f2f" if item["change_pct"] > 0 else "#1565c0"
+        rows += f"""
+        <tr>
+          <td style="padding:10px;border-bottom:1px solid #eee;">{item['product']}</td>
+          <td style="padding:10px;border-bottom:1px solid #eee;">{item['shop']}</td>
+          <td style="padding:10px;border-bottom:1px solid #eee;text-align:right;">{item['old_price']:,.0f}원</td>
+          <td style="padding:10px;border-bottom:1px solid #eee;text-align:right;">{item['new_price']:,.0f}원</td>
+          <td style="padding:10px;border-bottom:1px solid #eee;text-align:center;color:{color};font-weight:bold;">
+            {item['direction']} {abs(item['change_pct']):.1f}%
+          </td>
+        </tr>
+        """
+
+    html = f"""
+    <html><body style="font-family:Arial,sans-serif;max-width:700px;margin:0 auto;">
+      <div style="background:#1a237e;color:white;padding:20px;border-radius:8px 8px 0 0;">
+        <h2 style="margin:0;">🛍️ 면세점 가격 변동 알림</h2>
+        <p style="margin:5px 0 0;opacity:0.8;">{now} 기준 | 기준: {CONFIG['alert_threshold_pct']}% 이상 변동</p>
+      </div>
+      <table style="width:100%;border-collapse:collapse;background:white;box-shadow:0 2px 8px rgba(0,0,0,0.1);">
+        <thead>
+          <tr style="background:#e8eaf6;">
+            <th style="padding:12px;text-align:left;">상품</th>
+            <th style="padding:12px;text-align:left;">면세점</th>
+            <th style="padding:12px;text-align:right;">이전 가격</th>
+            <th style="padding:12px;text-align:right;">현재 가격</th>
+            <th style="padding:12px;text-align:center;">변동</th>
+          </tr>
+        </thead>
+        <tbody>{rows}</tbody>
+      </table>
+      <p style="color:#777;font-size:12px;padding:10px;">
+        * 데이터 출처: dutyful.co.kr | 자동 모니터링 알림
+      </p>
+    </body></html>
+    """
+
+    msg = MIMEMultipart("alternative")
+    msg["Subject"] = f"[면세점 알림] 가격 변동 {len(all_alerts)}건 감지 - {now}"
+    msg["From"] = CONFIG["sender_email"]
+    msg["To"] = CONFIG["receiver_email"]
+    msg.attach(MIMEText(html, "html"))
+
+    try:
+        with smtplib.SMTP_SSL("smtp.gmail.com", 465) as server:
+            server.login(CONFIG["sender_email"], CONFIG["sender_password"])
+            server.sendmail(CONFIG["sender_email"], CONFIG["receiver_email"], msg.as_string())
+        print(f"  ✅ 이메일 발송 완료 → {CONFIG['receiver_email']}")
+    except Exception as e:
+        print(f"  ❌ 이메일 발송 실패: {e}")
+
+
+# ── 메인 체크 루틴 ─────────────────────────────────────────
+def run_check():
+    print(f"\n{'='*50}")
+    print(f"🔍 가격 체크 시작: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+    print(f"{'='*50}")
+
+    db = load_price_db()
+    all_alerts = []
+
+    for product in CONFIG["products"]:
+        print(f"\n📦 {product['name']}")
+        new_prices = fetch_prices(product)
+
+        if not new_prices:
+            print("  ⚠️  가격 정보 없음 (사이트 구조 변경 또는 상품 없음)")
+            continue
+
+        print(f"  현재 가격: {new_prices}")
+
+        alerts = detect_changes(product["name"], new_prices, db)
+        for alert in alerts:
+            alert["product"] = product["name"]
+            all_alerts.append(alert)
+            print(f"  🚨 알림: {alert['shop']} {alert['direction']} {abs(alert['change_pct']):.1f}%")
+
+        # DB 업데이트
+        db[product["name"]] = new_prices
+
+    save_price_db(db)
+
+    if all_alerts:
+        print(f"\n📧 알림 이메일 발송 중... ({len(all_alerts)}건)")
+        send_alert_email(all_alerts)
+    else:
+        print("\n✅ 변동 없음 (알림 없음)")
+
+
+# ── 스케줄러 ───────────────────────────────────────────────
+if __name__ == "__main__":
+    print("🚀 면세점 가격 모니터링 시작")
+    print(f"   알림 기준: {CONFIG['alert_threshold_pct']}% 이상 변동")
+    print(f"   수신 이메일: {CONFIG['receiver_email']}")
+    print(f"   모니터링 상품: {len(CONFIG['products'])}개")
+
+    # 즉시 1회 실행
+    run_check()
+
+    # 이후 매 1시간마다 자동 실행
+    schedule.every(1).hours.do(run_check)
+
+    print("\n⏰ 1시간마다 자동 체크 중... (종료: Ctrl+C)")
+    while True:
+        schedule.run_pending()
+        time.sleep(60)
