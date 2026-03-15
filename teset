@@ -25,7 +25,7 @@ from datetime import datetime
 # ============================================================
 CONFIG = {
     # 이메일 설정 (Gmail 기준)
-    "sender_email": "your_gmail@gmail.com",       # 발신 Gmail 주소
+    "sender_email": "yeonjeong.kang@day1coampany.co.kr",       # 발신 Gmail 주소
     "sender_password": "xxxx xxxx xxxx xxxx",     # Gmail 앱 비밀번호 (2단계 인증 후 발급)
     "receiver_email": "your_email@example.com",   # 수신할 이메일
 
